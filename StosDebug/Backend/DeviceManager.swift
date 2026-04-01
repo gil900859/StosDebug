@@ -1,0 +1,590 @@
+//
+//  idevicemanager.swift
+//  StosDebug
+//
+//  Created by Stossy11 on 27/3/2026.
+//
+
+import Foundation
+import SwiftUI
+import Combine
+import Network
+import BackgroundTasks
+
+typealias RpPairingFileHandle = OpaquePointer
+typealias IdeviceProviderHandle = OpaquePointer
+typealias HeartbeatClientHandle = OpaquePointer
+typealias LockdowndClientHandle = OpaquePointer
+typealias ImageMounterHandle = OpaquePointer
+typealias CoreDeviceProxyHandle = OpaquePointer
+typealias AdapterHandle = OpaquePointer
+typealias AdapterStreamHandle = OpaquePointer
+typealias RsdHandshakeHandle = OpaquePointer
+typealias RemoteServerHandle = OpaquePointer
+typealias AppServerHandle = OpaquePointer
+typealias DebugProxyHandle = OpaquePointer
+typealias ProcessControlHandle = OpaquePointer
+typealias InstallationProxyClientHandle = OpaquePointer
+typealias SpringBoardServicesClientHandle = OpaquePointer
+typealias MounterClientHandle = OpaquePointer
+
+enum DeveloperDiskImage: String {
+    case image = "https://github.com/doronz88/DeveloperDiskImage/raw/refs/heads/main/PersonalizedImages/Xcode_iOS_DDI_Personalized/Image.dmg"
+    case imagetrustcache = "https://github.com/doronz88/DeveloperDiskImage/blob/main/PersonalizedImages/Xcode_iOS_DDI_Personalized/Image.dmg.trustcache"
+    case buildManifest = "https://github.com/doronz88/DeveloperDiskImage/raw/refs/heads/main/PersonalizedImages/Xcode_iOS_DDI_Personalized/BuildManifest.plist"
+}
+
+
+
+final class DeviceManager: ObservableObject {
+    static let shared = DeviceManager()
+    private init() {}
+    
+    public var jsViewModel: RunJSViewModel?
+    let fileManager = FileManager.default
+    
+    var pairingFileURL = URL.documentsDirectory.appendingPathComponent("pairingFile.plist")
+    
+    let pairingFileURL1 = URL.documentsDirectory.appendingPathComponent("pairingFile.plist")
+    let pairingFileURL2 = URL.documentsDirectory.appendingPathComponent("ios_pairing_file.plist")
+    
+    var adapter: AdapterHandle?
+    var handshake: RsdHandshakeHandle?
+    var pairing: RpPairingFileHandle?
+    
+    @Published var checkMounted: Task<Void, Never>? = nil
+    @Published var isMounted: DeviceError = .none
+    
+    @Published var mountTask: Task<Void, Never>? = nil
+    @Published var isMounting: DeviceError = .none
+    
+    func runMountDDI(_ check: Bool = false) {
+        if check && isMounting == .success {
+            return
+        }
+        
+        mountTask?.cancel()
+        mountTask = Task {
+            await MainActor.run {
+                isMounting = .loading
+            }
+            do {
+                try await mountPersonalDDI(
+                    imagePath: DeveloperDiskImage.image.rawValue,
+                    trustcachePath: DeveloperDiskImage.imagetrustcache.rawValue,
+                    manifestPath: DeveloperDiskImage.buildManifest.rawValue
+                )
+                await MainActor.run {
+                    isMounting = .success
+                }
+                
+                runCheckMounted()
+            } catch {
+                await MainActor.run {
+                    isMounting = .failure(issue: error.localizedDescription)
+                }
+            }
+        }
+    }
+    
+    func setupTunnel() async throws  {
+        if !fileManager.fileExists(atPath: pairingFileURL1.path) && fileManager.fileExists(atPath: pairingFileURL2.path) {
+            pairingFileURL = pairingFileURL2
+        }
+        let string = strdup(URL.documentsDirectory.appendingPathComponent("idevice_log.txt").path)
+        
+        idevice_init_logger(Debug, Debug, string)
+        let err = rp_pairing_file_read(pairingFileURL.path, &pairing)
+        
+        free(string)
+        
+        if let err {
+            throw "Pairing read failed: \(err.pointee.code) \(err.pointee.message.string)"
+        }
+        
+        var addr = sockaddr_in()
+        memset(&addr, 0, MemoryLayout<sockaddr_in>.size)
+        
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = CFSwapInt16HostToBig(49152)
+        
+        guard inet_pton(AF_INET, "10.7.0.1", &addr.sin_addr) == 1 else {
+            throw "Invalid IP (shouldn't be possible)"
+        }
+        
+        let pairing = pairing
+        
+        try await Task.detached {
+            var newAdapter: AdapterHandle?
+            var newHandshake: RsdHandshakeHandle?
+            
+            let result = withUnsafePointer(to: &addr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { ptr in
+                    tunnel_create_rppairing(
+                        ptr,
+                        socklen_t(MemoryLayout<sockaddr_in>.size),
+                        "StosDebug",
+                        pairing,
+                        nil,
+                        nil,
+                        &newAdapter,
+                        &newHandshake
+                    )
+                }
+            }
+            
+            if let result {
+                throw "Tunnel creation failed: \(result.pointee.code) \(await result.pointee.message.string)"
+            }
+            
+            let adapter = newAdapter
+            let handshake = newHandshake
+            await MainActor.run {
+                self.adapter = adapter
+                self.handshake = handshake
+            }
+        }.value
+    }
+    
+    
+    func startDebugApp(bundleID: String? = nil, pid: Int? = nil, forcePID: Bool = false, launchApp: Bool = false, useScript: Bool = false, script: Scripts? = nil, whenJSCreated: ((RunJSViewModel) -> Void)? = nil) -> Int {
+        
+        guard let adapter, let handshake else {
+            print("Tunnel not initialized")
+            return 1
+        }
+        
+        var err: UnsafeMutablePointer<IdeviceFfiError>?
+        
+        var remoteServer: RemoteServerHandle?
+        err = remote_server_connect_rsd(adapter, handshake, &remoteServer)
+        
+        if let err {
+            print("Remote server failed: \(err.pointee.message.string)")
+            return 1
+        }
+        
+        var debugProxy: DebugProxyHandle?
+        err = debug_proxy_connect_rsd(adapter, handshake, &debugProxy)
+        
+        if let err {
+            print("Debug proxy failed: \(err.pointee.message.string)")
+            return 1
+        }
+        
+        var finalPID = UInt64(pid ?? 0)
+        
+        if let bundleID, let pid, launchApp {
+            var backPid: UInt64 = 0
+            var processControl: ProcessControlHandle?
+            err = process_control_new(remoteServer, &processControl)
+            
+            if err == nil {
+                err = process_control_launch_app(
+                    processControl,
+                    bundleID,
+                    nil,
+                    0,
+                    nil,
+                    0,
+                    false,
+                    false,
+                    &backPid
+                )
+                
+                _ = process_control_disable_memory_limit(processControl, finalPID)
+                process_control_free(processControl)
+            }
+            
+            if backPid != pid && finalPID != 0 && !forcePID {
+                finalPID = backPid
+            }
+            
+        } else if let bundleID {
+            var processControl: ProcessControlHandle?
+            err = process_control_new(remoteServer, &processControl)
+            
+            if err == nil {
+                err = process_control_launch_app(
+                    processControl,
+                    bundleID,
+                    nil,
+                    0,
+                    nil,
+                    0,
+                    true,
+                    false,
+                    &finalPID
+                )
+                
+                _ = process_control_disable_memory_limit(processControl, finalPID)
+                process_control_free(processControl)
+            }
+        }
+        
+        if finalPID == 0 {
+            return 2
+        }
+        
+        debug_proxy_send_ack(debugProxy)
+        debug_proxy_send_ack(debugProxy)
+        
+        var disableResponse: UnsafeMutablePointer<CChar>?
+        let disableAckCommand = debugserver_command_new("QStartNoAckMode", nil, 0);
+        debug_proxy_send_command(debugProxy, disableAckCommand, &disableResponse)
+        debugserver_command_free(disableAckCommand)
+        debug_proxy_set_ack_mode(debugProxy, 0);
+        
+        
+        if useScript, let script {
+            let semaphore: dispatch_semaphore_t = DispatchSemaphore(value: 0)
+            
+            let viewModel = RunJSViewModel(pid: Int(finalPID), debugProxy: debugProxy, remoteServer: remoteServer, semaphore: semaphore)
+            
+            whenJSCreated?(viewModel)
+            
+            jsViewModel = viewModel
+            
+            guard let scriptData = script.scriptData  else {
+                Alert.showSyncAlert(title: "Missing Script Data", message: "Unable to get the Script Data", alertHandler: { _ in })
+                debug_proxy_free(debugProxy)
+                return 3
+            }
+            
+            if jsViewModel?.runScript(data: scriptData, name: script.scriptName) != nil {
+                semaphore.wait()
+                let _ = debug_proxy_send_raw(debugProxy, "\\x03", 1)
+                
+                if !script.persistent {
+                    if let (key, _) = Scripts.customScript.first(where: { $0.value == script }) {
+                        Scripts.customScript.removeValue(forKey: key)
+                    }
+                }
+                
+                usleep(500);
+                
+                debug_proxy_free(debugProxy)
+            }
+        } else {
+            let attachStr = String(format: "vAttach;%llx", finalPID)
+            let attachCmd = debugserver_command_new(attachStr, nil, 0)
+            
+            var response: UnsafeMutablePointer<CChar>?
+            _ = debug_proxy_send_command(debugProxy, attachCmd, &response)
+            
+            if response != nil {
+                idevice_string_free(response)
+            }
+            
+            debugserver_command_free(attachCmd)
+            
+            if let detachCmd = debugserver_command_new("D", nil, 0) {
+                var detachResp: UnsafeMutablePointer<CChar>?
+                for _ in 0..<3 {
+                    _ = debug_proxy_send_command(debugProxy, detachCmd, &detachResp)
+                }
+                if detachResp != nil {
+                    idevice_string_free(detachResp)
+                }
+                debugserver_command_free(detachCmd)
+            }
+        }
+        
+        
+        
+        return 0
+    }
+    
+    func listApps(gettaskallow: Bool = true) throws -> [SideApp] {
+        var client: InstallationProxyClientHandle? = nil
+
+        let error = installation_proxy_connect_rsd(adapter, handshake, &client)
+        if let error = error?.pointee {
+            print("First one")
+            print(error.message.string)
+            return []
+        }
+
+        defer { installation_proxy_client_free(client) }
+
+        var resultPlist: UnsafeMutableRawPointer? = nil
+        var resultCount: Int = 0
+        let getAppsError = installation_proxy_get_apps(client, "User", nil, 0, &resultPlist, &resultCount)
+        if let error = getAppsError {
+            print("second one")
+            print(error.pointee.message.string)
+            return []
+        }
+
+        guard let appsPointer = resultPlist else { return [] }
+        let appsArray = appsPointer.assumingMemoryBound(to: plist_t?.self)
+
+        defer {
+            for i in 0..<resultCount {
+                if let node = appsArray[i] {
+                    plist_free(node)
+                }
+            }
+        }
+        
+        var sideApps: [SideApp] = []
+        
+        for i in 0..<resultCount {
+            guard let app = appsArray[i] else { continue }
+            
+            if gettaskallow {
+                guard
+                    let entitlements = plist_dict_get_item(app, "Entitlements"),
+                    let getTaskNode = plist_dict_get_item(entitlements, "get-task-allow")
+                else { continue }
+                
+                var isAllowed: UInt8 = 0
+                plist_get_bool_val(getTaskNode, &isAllowed)
+                if isAllowed == 0 { continue }
+            }
+            
+            guard let bidNode = plist_dict_get_item(app, "CFBundleIdentifier") else { continue }
+            var bidC: UnsafeMutablePointer<CChar>? = nil
+            plist_get_string_val(bidNode, &bidC)
+            guard let bidCString = bidC, bidCString[0] != 0 else {
+                free(bidC)
+                continue
+            }
+            let bundleID = String(cString: bidCString)
+            free(bidC)
+            
+            var appName = "Unknown"
+            if let nameNode = plist_dict_get_item(app, "CFBundleName") {
+                var nameC: UnsafeMutablePointer<CChar>? = nil
+                plist_get_string_val(nameNode, &nameC)
+                if let nameCString = nameC, nameCString[0] != 0 {
+                    appName = String(cString: nameCString)
+                }
+                free(nameC)
+            }
+            
+            let sideApp = SideApp(name: appName, bundleIdentifier: bundleID)
+            sideApps.append(sideApp)
+        }
+        
+        return sideApps
+    }
+    
+    
+    func getAppIcon(bundleID: String) async -> Data? {
+        let adapter = adapter
+        let handshake = handshake
+        
+        return await Task.detached(priority: .userInitiated) {
+            var client: SpringBoardServicesClientHandle?
+            
+            if springboard_services_connect_rsd(adapter, handshake, &client) != nil {
+                return nil
+            }
+            
+            var iconData: UnsafeMutableRawPointer?
+            var iconDataLen: Int = 0
+            
+            if springboard_services_get_icon(client, bundleID, &iconData, &iconDataLen) != nil {
+                springboard_services_free(client)
+                return nil
+            }
+            
+            springboard_services_free(client)
+            
+            return Data(bytes: iconData!, count: iconDataLen)
+        }.value
+    }
+    
+    func isMounted() async throws -> Bool {
+        var mounterClient: MounterClientHandle?
+        var err = image_mounter_connect_rsd(adapter, handshake, &mounterClient)
+        
+        if let err {
+            throw err.pointee.message.string
+        }
+        
+        var devices: UnsafeMutablePointer<plist_t?>? = nil
+        var deviceLength: size_t = 0
+        
+        err = image_mounter_copy_devices(mounterClient, &devices, &deviceLength)
+        if let err {
+            throw err.pointee.message.string
+        }
+        
+        if let devicesPointer = devices {
+            for i in 0..<Int(deviceLength) {
+                if let device = devicesPointer[i] {
+                    plist_free(device)
+                }
+            }
+        }
+        
+        idevice_data_free(devices, UInt(deviceLength * MemoryLayout<UnsafeMutablePointer<plist_t>>.size))
+        image_mounter_free(mounterClient)
+        
+        return deviceLength > 0
+    }
+    
+    func downloadDataAsync(from urlString: String) async throws -> Data {
+        guard let url = URL(string: urlString) else {
+            throw NSError(domain: "InvalidURL", code: 0)
+        }
+        
+        var request = URLRequest(url: url)
+        request.cachePolicy = .useProtocolCachePolicy
+        
+        let (data, response) = try await URLSession.shared.data(for: request)
+        
+        if let http = response as? HTTPURLResponse {
+            print("Status:", http.statusCode)
+        }
+        
+        return data
+    }
+    
+    func runCheckMounted(mountIfNeeded: Bool = false) {
+        checkMounted?.cancel()
+        checkMounted = Task {
+            do {
+                await MainActor.run {
+                    isMounted = .loading
+                }
+                let mounted = try await DeviceManager.shared.isMounted()
+                await MainActor.run {
+                    isMounted = mounted ? .success : .notMounted
+                }
+                
+                if mountIfNeeded && !mounted {
+                    runMountDDI()
+                }
+            } catch {
+                await MainActor.run {
+                    isMounted = .failure(issue: error.localizedDescription)
+                }
+            }
+        }
+    }
+    
+    func mountPersonalDDI(
+        imagePath: String,
+        trustcachePath: String,
+        manifestPath: String
+    ) async throws {
+        let image = try await downloadDataAsync(from: imagePath)
+        let trustcache = try await downloadDataAsync(from: trustcachePath)
+        let buildManifest = try await downloadDataAsync(from: manifestPath)
+        
+        var lockdownClient: LockdowndClientHandle?
+        var err = lockdownd_connect_rsd(adapter, handshake, &lockdownClient)
+        if let err {
+            throw err.pointee.message.string
+        }
+        
+        var uniqueChipIdPlist: plist_t?
+        err = lockdownd_get_value(lockdownClient, "UniqueChipID", nil, &uniqueChipIdPlist)
+        if let err {
+            throw err.pointee.message.string
+        }
+        
+        
+        var uniqueChipId: UInt64 = 0
+        plist_get_uint_val(uniqueChipIdPlist, &uniqueChipId)
+        
+        
+        var mounterClient: MounterClientHandle?
+        err = image_mounter_connect_rsd(adapter, handshake, &mounterClient)
+        if let err {
+            throw err.pointee.message.string
+        }
+        
+        defer {
+            image_mounter_free(mounterClient)
+            lockdownd_client_free(lockdownClient)
+        }
+        
+        let adapter = adapter
+        let handshake = handshake
+        try await Task.detached {
+            return await withUnsafeBytes(of: image, trustcache, buildManifest) { unsafePointer in
+                image_mounter_mount_personalized_rsd(
+                    mounterClient,
+                    adapter,
+                    handshake,
+                    unsafePointer[0].uint8Pointer,
+                    image.count,
+                    unsafePointer[1].uint8Pointer,
+                    trustcache.count,
+                    unsafePointer[2].uint8Pointer,
+                    buildManifest.count,
+                    nil, uniqueChipId)
+                
+            }
+        }.value
+        
+        if let err {
+            throw err.pointee.message.string
+        }
+    }
+    
+    
+
+}
+
+func withUnsafeBytes<R>(
+    of buffers: Data...,
+    body: ([UnsafeRawBufferPointer]) throws -> R
+) rethrows -> R {
+    func open(_ remaining: ArraySlice<Data>, _ ptrs: [UnsafeRawBufferPointer]) throws -> R {
+        guard let head = remaining.first else { return try body(ptrs) }
+        return try head.withUnsafeBytes { try open(remaining.dropFirst(), ptrs + [$0]) }
+    }
+    return try open(buffers[...], [])
+}
+
+
+struct SideApp: Codable, Identifiable, Equatable {
+    var id: String { bundleIdentifier }
+    var name: String
+    var bundleIdentifier: String
+    var version: String?
+    var appIcon: Data?
+    var path: String? // .app path, not ipa
+    var isSideStore: Bool {
+        bundleIdentifier == Bundle.main.bundleIdentifier ?? "io.sidestore.SideStore.next"
+    }
+    
+    init(name: String, bundleIdentifier: String, version: String? = nil, appIcon: Data? = nil, path: String? = nil) {
+        self.name = name
+        self.bundleIdentifier = bundleIdentifier
+        self.version = version
+        self.appIcon = appIcon
+        self.path = path
+    }
+    
+    
+    
+}
+
+
+// extension String: @retroactive Error {}
+extension String: LocalizedError {
+    public var errorDescription: String? { self }
+}
+
+extension OpaquePointer: @retroactive @unchecked Sendable {
+    
+}
+
+
+// MARK: - Helpers
+
+extension UnsafeRawBufferPointer {
+    var uint8Pointer: UnsafePointer<UInt8> { baseAddress!.assumingMemoryBound(to: UInt8.self) }
+}
+
+extension UnsafePointer where Pointee == CChar {
+    var string: String {
+        String(cString: self)
+    }
+}
