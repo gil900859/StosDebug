@@ -1,4 +1,4 @@
-name: xcodebuild build
+name: Build iOS App
 
 on:
   push:
@@ -8,29 +8,23 @@ on:
 
 jobs:
   build:
-    name: Build default scheme using any available iPhone simulator
+    name: Build iOS Archive
     runs-on: macos-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Set Default Scheme
         run: |
           scheme_list=$(xcodebuild -list -json | tr -d "\n")
           default=$(echo $scheme_list | ruby -e "require 'json'; puts JSON.parse(STDIN.gets)['project']['targets'][0]")
-          echo $default > default
+          echo "$default" > default
           echo "Using default scheme: $default"
 
-      - name: Build
-        env:
-          scheme: ${{ 'default' }}
-          platform: ${{ 'iOS Simulator' }}
+      - name: Archive App (Generic iOS Target)
         run: |
-          # Target the simulator using its unique ID to prevent name/OS collisions
-          device_id=$(xcrun simctl list devices available | grep -m 1 "iPhone" | grep -oE '[0-9A-F]{8}-([0-9A-F]{4}-){3}[0-9A-F]{12}')
-          
-          if [ "$scheme" = "default" ]; then scheme=$(cat default); fi
+          scheme=$(cat default)
           if [ "$(ls -A | grep -i \.xcworkspace$)" ]; then 
             filetype_parameter="workspace"
             file_to_build="$(ls -A | grep -i \.xcworkspace$)"
@@ -39,4 +33,25 @@ jobs:
             file_to_build="$(ls -A | grep -i \.xcodeproj$)"
           fi
           
-          xcodebuild build -scheme "$scheme" -"$filetype_parameter" "$file_to_build" -destination "platform=$platform,id=$device_id"
+          # Target physical iOS architecture (arm64) to link against real device binaries
+          xcodebuild archive \
+            -scheme "$scheme" \
+            -"$filetype_parameter" "$file_to_build" \
+            -destination "generic/platform=iOS" \
+            -archivePath build/App.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
+      - name: Package Unsigned App Payload
+        run: |
+          # Convert the .xcarchive into a standard unsigned .ipa structure
+          mkdir -p build/Payload
+          cp -r build/App.xcarchive/Products/Applications/*.app build/Payload/
+          cd build
+          zip -r UnsignedApp.ipa Payload
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-ios-app
+          path: build/UnsignedApp.ipa
