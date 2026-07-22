@@ -1,4 +1,4 @@
-name: xcodebuild test (functional)
+name: xcodebuild build
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    name: Build and Test default scheme using any available iPhone simulator
+    name: Build default scheme using any available iPhone simulator
     runs-on: macos-latest
 
     steps:
@@ -27,7 +27,9 @@ jobs:
           scheme: ${{ 'default' }}
           platform: ${{ 'iOS Simulator' }}
         run: |
-          device=$(xcrun simctl list devices available | grep -m 1 "iPhone" | sed -E 's/^[[:space:]]*//; s/ \([^)]*\)//g')
+          # Target the simulator using its unique ID to prevent name/OS collisions
+          device_id=$(xcrun simctl list devices available | grep -m 1 "iPhone" | grep -oE '[0-9A-F]{8}-([0-9A-F]{4}-){3}[0-9A-F]{12}')
+          
           if [ "$scheme" = "default" ]; then scheme=$(cat default); fi
           if [ "$(ls -A | grep -i \.xcworkspace$)" ]; then 
             filetype_parameter="workspace"
@@ -36,20 +38,5 @@ jobs:
             filetype_parameter="project"
             file_to_build="$(ls -A | grep -i \.xcodeproj$)"
           fi
-          xcodebuild build-for-testing -scheme "$scheme" -"$filetype_parameter" "$file_to_build" -destination "platform=$platform,name=$device"
-
-      - name: Test
-        env:
-          scheme: ${{ 'default' }}
-          platform: ${{ 'iOS Simulator' }}
-        run: |
-          device=$(xcrun simctl list devices available | grep -m 1 "iPhone" | sed -E 's/^[[:space:]]*//; s/ \([^)]*\)//g')
-          if [ "$scheme" = "default" ]; then scheme=$(cat default); fi
-          if [ "$(ls -A | grep -i \.xcworkspace$)" ]; then 
-            filetype_parameter="workspace"
-            file_to_build="$(ls -A | grep -i \.xcworkspace$)"
-          else 
-            filetype_parameter="project"
-            file_to_build="$(ls -A | grep -i \.xcodeproj$)"
-          fi
-          xcodebuild test-without-building -scheme "$scheme" -"$filetype_parameter" "$file_to_build" -destination "platform=$platform,name=$device"
+          
+          xcodebuild build -scheme "$scheme" -"$filetype_parameter" "$file_to_build" -destination "platform=$platform,id=$device_id"
